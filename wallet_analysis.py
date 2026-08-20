@@ -86,7 +86,9 @@ def record_new_buys():
     c = conn.cursor()
 
     txs = get_wallet_recent_buys(TARGET_WALLET)
+    print(f"Fetched {len(txs)} transactions for {TARGET_WALLET}")
     mints = extract_buys(txs, TARGET_WALLET)
+    print(f"Extracted {len(mints)} unique mint buys")
 
     for mint in mints:
         c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
