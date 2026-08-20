@@ -1,3 +1,6 @@
+import sys
+print("=== SCRIPT LOADED ===", flush=True)
+
 import os
 import psycopg2
 import requests
@@ -8,6 +11,8 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 TARGET_WALLET = os.environ.get("TARGET_WALLET")
+
+print(f"Config loaded — DATABASE_URL set: {bool(DATABASE_URL)}, HELIUS_API_KEY set: {bool(HELIUS_API_KEY)}, TARGET_WALLET: {TARGET_WALLET}", flush=True)
 
 
 def get_conn():
@@ -32,6 +37,7 @@ def init_db():
     conn.commit()
     c.close()
     conn.close()
+    print("init_db() completed", flush=True)
 
 
 def get_current_market_cap(mint):
@@ -47,7 +53,7 @@ def get_current_market_cap(mint):
         fdv = pairs[0].get("fdv")
         return float(fdv) if fdv else None
     except Exception as e:
-        print(f"get_current_market_cap error for {mint}: {e}")
+        print(f"get_current_market_cap error for {mint}: {e}", flush=True)
         return None
 
 
@@ -56,13 +62,13 @@ def get_wallet_recent_transactions(wallet, limit=50):
         url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
         params = {"api-key": HELIUS_API_KEY, "limit": limit}
         resp = requests.get(url, params=params, timeout=15)
-        print(f"Helius response status: {resp.status_code}")
+        print(f"Helius response status: {resp.status_code}", flush=True)
         if resp.status_code != 200:
-            print(f"Helius error body: {resp.text[:300]}")
+            print(f"Helius error body: {resp.text[:300]}", flush=True)
             return []
         return resp.json()
     except Exception as e:
-        print(f"get_wallet_recent_transactions error: {e}")
+        print(f"get_wallet_recent_transactions error: {e}", flush=True)
         return []
 
 
@@ -78,39 +84,39 @@ def extract_bought_mints(transactions, wallet):
 
 
 def record_new_buys():
-    print("=== record_new_buys() starting ===")
+    print("=== record_new_buys() starting ===", flush=True)
 
     if not TARGET_WALLET:
-        print("ERROR: TARGET_WALLET is not set")
+        print("ERROR: TARGET_WALLET is not set", flush=True)
         return
     if not HELIUS_API_KEY:
-        print("ERROR: HELIUS_API_KEY is not set")
+        print("ERROR: HELIUS_API_KEY is not set", flush=True)
         return
     if not DATABASE_URL:
-        print("ERROR: DATABASE_URL is not set")
+        print("ERROR: DATABASE_URL is not set", flush=True)
         return
 
-    print(f"Using wallet: {TARGET_WALLET}")
+    print(f"Using wallet: {TARGET_WALLET}", flush=True)
 
     try:
         conn = get_conn()
         c = conn.cursor()
-        print("Database connected")
+        print("Database connected", flush=True)
     except Exception as e:
-        print(f"DATABASE CONNECTION FAILED: {e}")
+        print(f"DATABASE CONNECTION FAILED: {e}", flush=True)
         return
 
     txs = get_wallet_recent_transactions(TARGET_WALLET)
-    print(f"Fetched {len(txs)} transactions")
+    print(f"Fetched {len(txs)} transactions", flush=True)
 
     if not txs:
-        print("No transactions returned — stopping here")
+        print("No transactions returned — stopping here", flush=True)
         c.close()
         conn.close()
         return
 
     mints = extract_bought_mints(txs, TARGET_WALLET)
-    print(f"Found {len(mints)} unique mints bought: {mints[:5]}{'...' if len(mints) > 5 else ''}")
+    print(f"Found {len(mints)} unique mints bought", flush=True)
 
     recorded_count = 0
     for mint in mints:
@@ -121,10 +127,10 @@ def record_new_buys():
 
             market_cap = get_current_market_cap(mint)
             if market_cap is None:
-                print(f"  {mint}: no market cap data, skipping")
+                print(f"  {mint}: no market cap data, skipping", flush=True)
                 continue
             if market_cap >= 20000:
-                print(f"  {mint}: market cap ${market_cap:,.0f} too high, skipping")
+                print(f"  {mint}: market cap ${market_cap:,.0f} too high, skipping", flush=True)
                 continue
 
             c.execute(
@@ -132,26 +138,26 @@ def record_new_buys():
                 (mint, TARGET_WALLET, market_cap)
             )
             recorded_count += 1
-            print(f"  RECORDED: {mint} at ${market_cap:,.0f}")
+            print(f"  RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
 
         except Exception as e:
-            print(f"  Error processing {mint}: {e}")
+            print(f"  Error processing {mint}: {e}", flush=True)
             conn.rollback()
             continue
 
     conn.commit()
     c.close()
     conn.close()
-    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded ===")
+    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded ===", flush=True)
 
 
 def check_outcomes():
-    print("=== check_outcomes() starting ===")
+    print("=== check_outcomes() starting ===", flush=True)
     try:
         conn = get_conn()
         c = conn.cursor()
     except Exception as e:
-        print(f"DATABASE CONNECTION FAILED: {e}")
+        print(f"DATABASE CONNECTION FAILED: {e}", flush=True)
         return
 
     c.execute("""
@@ -160,7 +166,7 @@ def check_outcomes():
         AND buy_time <= NOW() - INTERVAL '3 days'
     """)
     ready = c.fetchall()
-    print(f"{len(ready)} buys ready for outcome check")
+    print(f"{len(ready)} buys ready for outcome check", flush=True)
 
     for row_id, mint in ready:
         current_mc = get_current_market_cap(mint)
@@ -168,16 +174,17 @@ def check_outcomes():
             "UPDATE tracked_buys SET checked_final = TRUE, outcome_market_cap = %s, outcome_checked_at = NOW() WHERE id = %s",
             (current_mc, row_id)
         )
-        print(f"  Checked: {mint} -> ${current_mc}")
+        print(f"  Checked: {mint} -> ${current_mc}", flush=True)
 
     conn.commit()
     c.close()
     conn.close()
-    print("=== check_outcomes() finished ===")
+    print("=== check_outcomes() finished ===", flush=True)
 
 
 @app.route("/run-check", methods=["GET", "POST"])
 def run_check():
+    print(">>> /run-check endpoint HIT <<<", flush=True)
     record_new_buys()
     check_outcomes()
     return jsonify({"status": "done"})
@@ -217,7 +224,9 @@ def home():
     return "Wallet analysis tool running"
 
 
+print("=== Calling init_db() ===", flush=True)
 init_db()
 
 if __name__ == "__main__":
+    print("=== Starting Flask app ===", flush=True)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
