@@ -78,17 +78,23 @@ def extract_buys(transactions, wallet):
 
 
 def record_new_buys():
+    print("record_new_buys() started")
     if not TARGET_WALLET:
         print("No TARGET_WALLET configured")
         return
 
-    conn = get_conn()
-    c = conn.cursor()
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        print("DB connected successfully")
 
-    txs = get_wallet_recent_buys(TARGET_WALLET)
-    print(f"Fetched {len(txs)} transactions for {TARGET_WALLET}")
-    mints = extract_buys(txs, TARGET_WALLET)
-    print(f"Extracted {len(mints)} unique mint buys")
+        txs = get_wallet_recent_buys(TARGET_WALLET)
+        print(f"Fetched {len(txs)} transactions for {TARGET_WALLET}")
+        mints = extract_buys(txs, TARGET_WALLET)
+        print(f"Extracted {len(mints)} unique mint buys")
+    except Exception as e:
+        print(f"record_new_buys CRASHED: {e}")
+        return
 
     for mint in mints:
         c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
