@@ -1,8 +1,6 @@
 import os
-import sqlite3
-import requests
-import time
 import psycopg2
+import requests
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -26,7 +24,6 @@ def init_db():
             wallet TEXT,
             buy_time TIMESTAMP DEFAULT NOW(),
             market_cap_at_buy NUMERIC,
-            price_at_buy NUMERIC,
             checked_final BOOLEAN DEFAULT FALSE,
             outcome_market_cap NUMERIC,
             outcome_checked_at TIMESTAMP
@@ -47,78 +44,115 @@ def get_current_market_cap(mint):
         pairs = data.get("pairs") or []
         if not pairs:
             return None
-        return pairs[0].get("fdv")
+        fdv = pairs[0].get("fdv")
+        return float(fdv) if fdv else None
     except Exception as e:
-        print(f"Error fetching market cap for {mint}: {e}")
+        print(f"get_current_market_cap error for {mint}: {e}")
         return None
 
 
-def get_wallet_recent_buys(wallet, limit=50):
+def get_wallet_recent_transactions(wallet, limit=50):
     try:
         url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
         params = {"api-key": HELIUS_API_KEY, "limit": limit}
         resp = requests.get(url, params=params, timeout=15)
+        print(f"Helius response status: {resp.status_code}")
         if resp.status_code != 200:
+            print(f"Helius error body: {resp.text[:300]}")
             return []
         return resp.json()
     except Exception as e:
-        print(f"Error fetching transactions: {e}")
+        print(f"get_wallet_recent_transactions error: {e}")
         return []
 
 
-def extract_buys(transactions, wallet):
-    mints_found = []
+def extract_bought_mints(transactions, wallet):
+    mints = set()
     for tx in transactions:
         for transfer in tx.get("tokenTransfers", []) or []:
             if transfer.get("toUserAccount") == wallet:
                 mint = transfer.get("mint")
                 if mint:
-                    mints_found.append(mint)
-    return list(set(mints_found))
+                    mints.add(mint)
+    return list(mints)
 
 
 def record_new_buys():
-    print("record_new_buys() started")
+    print("=== record_new_buys() starting ===")
+
     if not TARGET_WALLET:
-        print("No TARGET_WALLET configured")
+        print("ERROR: TARGET_WALLET is not set")
         return
+    if not HELIUS_API_KEY:
+        print("ERROR: HELIUS_API_KEY is not set")
+        return
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL is not set")
+        return
+
+    print(f"Using wallet: {TARGET_WALLET}")
 
     try:
         conn = get_conn()
         c = conn.cursor()
-        print("DB connected successfully")
-
-        txs = get_wallet_recent_buys(TARGET_WALLET)
-        print(f"Fetched {len(txs)} transactions for {TARGET_WALLET}")
-        mints = extract_buys(txs, TARGET_WALLET)
-        print(f"Extracted {len(mints)} unique mint buys")
+        print("Database connected")
     except Exception as e:
-        print(f"record_new_buys CRASHED: {e}")
+        print(f"DATABASE CONNECTION FAILED: {e}")
         return
 
+    txs = get_wallet_recent_transactions(TARGET_WALLET)
+    print(f"Fetched {len(txs)} transactions")
+
+    if not txs:
+        print("No transactions returned — stopping here")
+        c.close()
+        conn.close()
+        return
+
+    mints = extract_bought_mints(txs, TARGET_WALLET)
+    print(f"Found {len(mints)} unique mints bought: {mints[:5]}{'...' if len(mints) > 5 else ''}")
+
+    recorded_count = 0
     for mint in mints:
-        c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
-        if c.fetchone():
-            continue
+        try:
+            c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
+            if c.fetchone():
+                continue
 
-        market_cap = get_current_market_cap(mint)
-        if market_cap is None or market_cap >= 20000:
-            continue
+            market_cap = get_current_market_cap(mint)
+            if market_cap is None:
+                print(f"  {mint}: no market cap data, skipping")
+                continue
+            if market_cap >= 20000:
+                print(f"  {mint}: market cap ${market_cap:,.0f} too high, skipping")
+                continue
 
-        c.execute(
-            "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
-            (mint, TARGET_WALLET, market_cap)
-        )
-        print(f"Recorded new buy: {mint} at ${market_cap:,.0f}")
+            c.execute(
+                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
+                (mint, TARGET_WALLET, market_cap)
+            )
+            recorded_count += 1
+            print(f"  RECORDED: {mint} at ${market_cap:,.0f}")
+
+        except Exception as e:
+            print(f"  Error processing {mint}: {e}")
+            conn.rollback()
+            continue
 
     conn.commit()
     c.close()
     conn.close()
+    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded ===")
 
 
 def check_outcomes():
-    conn = get_conn()
-    c = conn.cursor()
+    print("=== check_outcomes() starting ===")
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+    except Exception as e:
+        print(f"DATABASE CONNECTION FAILED: {e}")
+        return
 
     c.execute("""
         SELECT id, mint FROM tracked_buys
@@ -126,6 +160,7 @@ def check_outcomes():
         AND buy_time <= NOW() - INTERVAL '3 days'
     """)
     ready = c.fetchall()
+    print(f"{len(ready)} buys ready for outcome check")
 
     for row_id, mint in ready:
         current_mc = get_current_market_cap(mint)
@@ -133,11 +168,12 @@ def check_outcomes():
             "UPDATE tracked_buys SET checked_final = TRUE, outcome_market_cap = %s, outcome_checked_at = NOW() WHERE id = %s",
             (current_mc, row_id)
         )
-        print(f"Checked outcome: {mint} → ${current_mc}")
+        print(f"  Checked: {mint} -> ${current_mc}")
 
     conn.commit()
     c.close()
     conn.close()
+    print("=== check_outcomes() finished ===")
 
 
 @app.route("/run-check", methods=["GET", "POST"])
@@ -152,9 +188,8 @@ def results():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT mint, market_cap_at_buy, outcome_market_cap, buy_time
+        SELECT mint, market_cap_at_buy, outcome_market_cap, buy_time, checked_final
         FROM tracked_buys
-        WHERE checked_final = TRUE
         ORDER BY buy_time DESC
     """)
     rows = c.fetchall()
@@ -162,14 +197,17 @@ def results():
     conn.close()
 
     output = []
-    for mint, entry_mc, exit_mc, buy_time in rows:
-        mult = (float(exit_mc) / float(entry_mc)) if exit_mc and entry_mc else None
+    for mint, entry_mc, exit_mc, buy_time, checked in rows:
+        mult = None
+        if exit_mc and entry_mc:
+            mult = round(float(exit_mc) / float(entry_mc), 2)
         output.append({
             "mint": mint,
             "entry_market_cap": float(entry_mc) if entry_mc else None,
             "exit_market_cap": float(exit_mc) if exit_mc else None,
-            "multiplier": round(mult, 2) if mult else None,
-            "buy_time": str(buy_time)
+            "multiplier": mult,
+            "buy_time": str(buy_time),
+            "checked_final": checked
         })
     return jsonify(output)
 
@@ -182,4 +220,4 @@ def home():
 init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
