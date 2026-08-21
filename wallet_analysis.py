@@ -2,6 +2,7 @@ import sys
 print("=== SCRIPT LOADED ===", flush=True)
 
 import os
+import time
 import psycopg2
 import requests
 from flask import Flask, jsonify
