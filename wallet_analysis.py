@@ -45,6 +45,7 @@ def get_current_market_cap(mint):
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=8)
         if resp.status_code != 200:
+            print(f"  DexScreener non-200 for {mint}: HTTP {resp.status_code}", flush=True)
             return None
         data = resp.json()
         pairs = data.get("pairs") or []
@@ -55,6 +56,34 @@ def get_current_market_cap(mint):
     except Exception as e:
         print(f"get_current_market_cap error for {mint}: {e}", flush=True)
         return None
+
+
+def get_market_caps_batch(mints):
+    if not mints:
+        return {}
+
+    result = {}
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        try:
+            joined = ",".join(chunk)
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                print(f"DexScreener batch non-200: HTTP {resp.status_code}", flush=True)
+                continue
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            for pair in pairs:
+                mint = pair.get("baseToken", {}).get("address")
+                fdv = pair.get("fdv")
+                if mint and fdv and mint not in result:
+                    result[mint] = float(fdv)
+        except Exception as e:
+            print(f"get_market_caps_batch error on chunk: {e}", flush=True)
+        time.sleep(0.5)
+
+    return result
 
 
 def get_wallet_recent_transactions(wallet, limit=50):
@@ -118,6 +147,9 @@ def record_new_buys():
     mints = extract_bought_mints(txs, TARGET_WALLET)
     print(f"Found {len(mints)} unique mints bought", flush=True)
 
+    market_caps = get_market_caps_batch(mints)
+    print(f"Got market cap data for {len(market_caps)} of {len(mints)} mints", flush=True)
+
     recorded_count = 0
     for mint in mints:
         try:
@@ -125,7 +157,7 @@ def record_new_buys():
             if c.fetchone():
                 continue
 
-            market_cap = get_current_market_cap(mint)
+            market_cap = market_caps.get(mint)
             if market_cap is None:
                 print(f"  {mint}: no market cap data, skipping", flush=True)
                 continue
