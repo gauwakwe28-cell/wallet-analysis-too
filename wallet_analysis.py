@@ -70,19 +70,26 @@ def get_market_caps_batch(mints):
             joined = ",".join(chunk)
             url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
             resp = requests.get(url, timeout=10)
-            if resp.status_code != 200:
-                print(f"DexScreener batch non-200: HTTP {resp.status_code}", flush=True)
-                continue
-            data = resp.json()
-            pairs = data.get("pairs") or []
-            for pair in pairs:
-                mint = pair.get("baseToken", {}).get("address")
-                fdv = pair.get("fdv")
-                if mint and fdv and mint not in result:
-                    result[mint] = float(fdv)
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get("pairs") or []
+                for pair in pairs:
+                    mint = pair.get("baseToken", {}).get("address")
+                    fdv = pair.get("fdv")
+                    if mint and fdv and mint not in result:
+                        result[mint] = float(fdv)
         except Exception as e:
             print(f"get_market_caps_batch error on chunk: {e}", flush=True)
         time.sleep(0.5)
+
+    missing = [m for m in mints if m not in result]
+    if missing:
+        print(f"Batch missed {len(missing)} mints, retrying individually", flush=True)
+        for mint in missing:
+            mc = get_current_market_cap(mint)
+            if mc is not None:
+                result[mint] = mc
+            time.sleep(0.3)
 
     return result
 
