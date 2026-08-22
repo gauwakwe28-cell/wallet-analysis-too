@@ -259,6 +259,56 @@ def results():
     return jsonify(output)
 
 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    if not data:
+        return "no data", 400
+
+    transactions = data if isinstance(data, list) else [data]
+    print(f"Webhook received {len(transactions)} transaction(s)", flush=True)
+
+    for tx in transactions:
+        if not isinstance(tx, dict):
+            continue
+        mints = extract_bought_mints([tx], TARGET_WALLET)
+        for mint in mints:
+            record_single_buy(mint)
+
+    return "ok", 200
+
+
+def record_single_buy(mint):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
+        if c.fetchone():
+            c.close()
+            return
+
+        market_cap = get_current_market_cap(mint)
+        if market_cap is None or market_cap >= 20000:
+            c.close()
+            return
+
+        c.execute(
+            "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
+            (mint, TARGET_WALLET, market_cap)
+        )
+        conn.commit()
+        c.close()
+        print(f"WEBHOOK RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
+    except Exception as e:
+        print(f"record_single_buy error for {mint}: {e}", flush=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
+
+
 @app.route("/")
 def home():
     return "Wallet analysis tool running"
