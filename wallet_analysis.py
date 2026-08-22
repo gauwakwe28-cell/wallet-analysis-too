@@ -15,6 +15,16 @@ TARGET_WALLET = os.environ.get("TARGET_WALLET")
 
 print(f"Config loaded — DATABASE_URL set: {bool(DATABASE_URL)}, HELIUS_API_KEY set: {bool(HELIUS_API_KEY)}, TARGET_WALLET: {TARGET_WALLET}", flush=True)
 
+_market_cap_cache = {}
+_last_dexscreener_call = {"time": 0}
+
+
+def _wait_for_rate_limit(min_interval=1.5):
+    elapsed = time.time() - _last_dexscreener_call["time"]
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
+    _last_dexscreener_call["time"] = time.time()
+
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -42,7 +52,14 @@ def init_db():
 
 
 def get_current_market_cap(mint, retries=3):
+    now = time.time()
+    if mint in _market_cap_cache:
+        cached_at, value = _market_cap_cache[mint]
+        if now - cached_at < 60:
+            return value
+
     try:
+        _wait_for_rate_limit()
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=8)
         if resp.status_code == 429 and retries > 0:
@@ -58,7 +75,9 @@ def get_current_market_cap(mint, retries=3):
         if not pairs:
             return None
         fdv = pairs[0].get("fdv")
-        return float(fdv) if fdv else None
+        value = float(fdv) if fdv else None
+        _market_cap_cache[mint] = (now, value)
+        return value
     except Exception as e:
         print(f"get_current_market_cap error for {mint}: {e}", flush=True)
         return None
@@ -72,6 +91,7 @@ def get_market_caps_batch(mints):
     for i in range(0, len(mints), 30):
         chunk = mints[i:i + 30]
         try:
+            _wait_for_rate_limit()
             joined = ",".join(chunk)
             url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
             resp = requests.get(url, timeout=10)
@@ -83,11 +103,11 @@ def get_market_caps_batch(mints):
                     fdv = pair.get("fdv")
                     if mint and fdv and mint not in result:
                         result[mint] = float(fdv)
+                        _market_cap_cache[mint] = (time.time(), float(fdv))
             else:
                 print(f"DexScreener batch non-200: HTTP {resp.status_code}", flush=True)
         except Exception as e:
             print(f"get_market_caps_batch error on chunk: {e}", flush=True)
-        time.sleep(0.5)
 
     missing = [m for m in mints if m not in result]
     if missing:
@@ -96,7 +116,6 @@ def get_market_caps_batch(mints):
             mc = get_current_market_cap(mint)
             if mc is not None:
                 result[mint] = mc
-            time.sleep(0.3)
 
     return result
 
