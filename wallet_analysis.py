@@ -478,6 +478,18 @@ def results():
     return jsonify(output)
 
 
+@app.route("/cleanup-null-entries", methods=["GET", "POST"])
+def cleanup_null_entries():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM tracked_buys WHERE market_cap_at_buy IS NULL")
+    deleted = c.rowcount
+    conn.commit()
+    c.close()
+    conn.close()
+    return jsonify({"deleted": deleted})
+
+
 @app.route("/")
 def home():
     return "Wallet analysis tool running"
