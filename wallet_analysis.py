@@ -5,7 +5,7 @@ import os
 import time
 import psycopg2
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
