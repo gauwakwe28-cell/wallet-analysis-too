@@ -72,7 +72,7 @@ def get_current_market_cap(mint, retries=3):
     now = time.time()
     if mint in _market_cap_cache:
         cached_at, value = _market_cap_cache[mint]
-        if now - cached_at < 300:
+        if now - cached_at < 90:  # 90 seconds for hits AND misses
             return value if value is not False else None
 
     try:
@@ -99,10 +99,16 @@ def get_current_market_cap(mint, retries=3):
             _market_cap_cache[mint] = (now, False)
             return None
 
-        fdv = pairs[0].get("fdv")
-        value = float(fdv) if fdv else None
-        _market_cap_cache[mint] = (now, value if value is not None else False)
-        return value
+        # FIX: scan ALL pairs for the first one with a valid fdv
+        for pair in pairs:
+            fdv = pair.get("fdv")
+            if fdv is not None and fdv != "":
+                value = float(fdv)
+                _market_cap_cache[mint] = (now, value)
+                return value
+
+        _market_cap_cache[mint] = (now, False)
+        return None
     except Exception as e:
         print(f"get_current_market_cap error for {mint}: {e}", flush=True)
         return None
@@ -115,6 +121,7 @@ def get_market_caps_batch(mints):
     result = {}
     for i in range(0, len(mints), 30):
         chunk = mints[i:i + 30]
+        chunk_set = set(chunk)
         try:
             _wait_for_rate_limit(min_interval=2.5)
             joined = ",".join(chunk)
@@ -134,11 +141,21 @@ def get_market_caps_batch(mints):
                 data = resp.json()
                 pairs = data.get("pairs") or []
                 for pair in pairs:
-                    mint = pair.get("baseToken", {}).get("address")
                     fdv = pair.get("fdv")
-                    if mint and fdv and mint not in result:
-                        result[mint] = float(fdv)
-                        _market_cap_cache[mint] = (time.time(), float(fdv))
+                    if fdv is None or fdv == "":
+                        continue
+
+                    # FIX: check BOTH baseToken and quoteToken addresses
+                    base_mint = pair.get("baseToken", {}).get("address")
+                    quote_mint = pair.get("quoteToken", {}).get("address")
+
+                    if base_mint and base_mint in chunk_set and base_mint not in result:
+                        result[base_mint] = float(fdv)
+                        _market_cap_cache[base_mint] = (time.time(), float(fdv))
+
+                    if quote_mint and quote_mint in chunk_set and quote_mint not in result:
+                        result[quote_mint] = float(fdv)
+                        _market_cap_cache[quote_mint] = (time.time(), float(fdv))
             else:
                 print(f"DexScreener batch non-200: HTTP {resp.status_code}", flush=True)
         except Exception as e:
@@ -360,7 +377,6 @@ def check_outcomes():
         print("=== check_outcomes() finished — nothing to check ===", flush=True)
         return
 
-    # Batch outcome checks instead of one-by-one
     ids_and_mints = ready
     mints = [row[1] for row in ids_and_mints]
     market_caps = get_market_caps_batch(mints)
@@ -405,7 +421,6 @@ def run_check():
             return jsonify({"status": "already_running"}), 200
         _job_running = True
 
-    # Start background thread so the HTTP response returns immediately
     thread = threading.Thread(target=run_all_checks, daemon=True)
     thread.start()
 
