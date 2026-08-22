@@ -21,6 +21,10 @@ _dex_lock = threading.Lock()
 _next_allowed_request_time = 0
 _market_cap_cache = {}  # mint -> (timestamp, value_or_False)
 
+# --- Background job lock so cron jobs don't pile up ---
+_job_lock = threading.Lock()
+_job_running = False
+
 
 def _wait_for_rate_limit(min_interval=2.5, retry_after=0):
     global _next_allowed_request_time
@@ -350,8 +354,20 @@ def check_outcomes():
     ready = c.fetchall()
     print(f"{len(ready)} buys ready for outcome check", flush=True)
 
-    for row_id, mint in ready:
-        current_mc = get_current_market_cap(mint)
+    if not ready:
+        c.close()
+        conn.close()
+        print("=== check_outcomes() finished — nothing to check ===", flush=True)
+        return
+
+    # Batch outcome checks instead of one-by-one
+    ids_and_mints = ready
+    mints = [row[1] for row in ids_and_mints]
+    market_caps = get_market_caps_batch(mints)
+    print(f"Resolved {len(market_caps)} outcome market caps in batch", flush=True)
+
+    for row_id, mint in ids_and_mints:
+        current_mc = market_caps.get(mint)
         c.execute(
             "UPDATE tracked_buys SET checked_final = TRUE, outcome_market_cap = %s, outcome_checked_at = NOW() WHERE id = %s",
             (current_mc, row_id)
@@ -364,13 +380,36 @@ def check_outcomes():
     print("=== check_outcomes() finished ===", flush=True)
 
 
+def run_all_checks():
+    """Runs the full check cycle in a background thread."""
+    global _job_running
+    try:
+        process_pending_mints()
+        record_new_buys()
+        check_outcomes()
+    except Exception as e:
+        print(f"Background check error: {e}", flush=True)
+    finally:
+        with _job_lock:
+            _job_running = False
+        print("=== Background job finished ===", flush=True)
+
+
 @app.route("/run-check", methods=["GET", "POST"])
 def run_check():
+    global _job_running
     print(">>> /run-check endpoint HIT <<<", flush=True)
-    process_pending_mints()
-    record_new_buys()
-    check_outcomes()
-    return jsonify({"status": "done"})
+
+    with _job_lock:
+        if _job_running:
+            return jsonify({"status": "already_running"}), 200
+        _job_running = True
+
+    # Start background thread so the HTTP response returns immediately
+    thread = threading.Thread(target=run_all_checks, daemon=True)
+    thread.start()
+
+    return jsonify({"status": "started"}), 202
 
 
 @app.route("/webhook", methods=["POST"])
