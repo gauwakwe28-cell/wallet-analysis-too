@@ -24,7 +24,7 @@ _last_dexscreener_call = {"time": 0}
 _market_cap_cache = {}
 
 
-def _wait_for_rate_limit(min_interval=2.5):
+def _wait_for_rate_limit(min_interval=60):
     with _dex_lock:
         elapsed = time.time() - _last_dexscreener_call["time"]
         if elapsed < min_interval:
