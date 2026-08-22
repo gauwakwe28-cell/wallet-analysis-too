@@ -41,10 +41,14 @@ def init_db():
     print("init_db() completed", flush=True)
 
 
-def get_current_market_cap(mint):
+def get_current_market_cap(mint, retries=1):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=8)
+        if resp.status_code == 429 and retries > 0:
+            print(f"  DexScreener 429 for {mint}, retrying after delay", flush=True)
+            time.sleep(2)
+            return get_current_market_cap(mint, retries=retries - 1)
         if resp.status_code != 200:
             print(f"  DexScreener non-200 for {mint}: HTTP {resp.status_code}", flush=True)
             return None
