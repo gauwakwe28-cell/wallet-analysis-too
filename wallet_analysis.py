@@ -16,20 +16,27 @@ TARGET_WALLET = os.environ.get("TARGET_WALLET")
 
 print(f"Config loaded — DATABASE_URL set: {bool(DATABASE_URL)}, HELIUS_API_KEY set: {bool(HELIUS_API_KEY)}, TARGET_WALLET: {TARGET_WALLET}", flush=True)
 
-# --- Rate limiter: thread-safe with lock ---
+# --- Global rate limiter: one shared clock + 429 ban timer ---
 _dex_lock = threading.Lock()
-_last_dexscreener_call = {"time": 0}
-
-# Cache: mint -> (timestamp, value). value = False means "no data / dead mint"
-_market_cap_cache = {}
+_next_allowed_request_time = 0
+_market_cap_cache = {}  # mint -> (timestamp, value_or_False)
 
 
-def _wait_for_rate_limit(min_interval=60):
+def _wait_for_rate_limit(min_interval=2.5, retry_after=0):
+    global _next_allowed_request_time
     with _dex_lock:
-        elapsed = time.time() - _last_dexscreener_call["time"]
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        _last_dexscreener_call["time"] = time.time()
+        now = time.time()
+        if retry_after:
+            ban_until = now + retry_after
+            if ban_until > _next_allowed_request_time:
+                _next_allowed_request_time = ban_until
+                print(f"  [RATE LIMIT] Global backoff set: {retry_after}s", flush=True)
+
+        wait_until = max(_next_allowed_request_time, now + min_interval)
+        sleep_time = wait_until - now
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        _next_allowed_request_time = time.time() + min_interval
 
 
 def get_conn():
@@ -65,16 +72,15 @@ def get_current_market_cap(mint, retries=3):
             return value if value is not False else None
 
     try:
-        _wait_for_rate_limit()
+        _wait_for_rate_limit(min_interval=2.5)
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=8)
 
         if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after else (4 - retries) * 3
-            print(f"  DexScreener 429 for {mint}, backing off {wait}s", flush=True)
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            print(f"  DexScreener 429 for {mint}, global backoff {retry_after}s", flush=True)
+            _wait_for_rate_limit(retry_after=retry_after)
             if retries > 0:
-                time.sleep(wait)
                 return get_current_market_cap(mint, retries=retries - 1)
             _market_cap_cache[mint] = (now, False)
             return None
@@ -106,18 +112,19 @@ def get_market_caps_batch(mints):
     for i in range(0, len(mints), 30):
         chunk = mints[i:i + 30]
         try:
-            _wait_for_rate_limit()
+            _wait_for_rate_limit(min_interval=2.5)
             joined = ",".join(chunk)
             url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
             resp = requests.get(url, timeout=10)
 
             if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                wait = int(retry_after) if retry_after else 5
-                print(f"DexScreener batch 429, backing off {wait}s", flush=True)
-                time.sleep(wait)
-                _wait_for_rate_limit()
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                print(f"DexScreener batch 429, global backoff {retry_after}s", flush=True)
+                _wait_for_rate_limit(retry_after=retry_after)
                 resp = requests.get(url, timeout=10)
+                if resp.status_code == 429:
+                    print(f"DexScreener batch 429 on retry, skipping chunk", flush=True)
+                    continue
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -173,6 +180,58 @@ def extract_bought_mints(transactions, wallet):
     return list(mints)
 
 
+def process_pending_mints():
+    """Fetch market caps for mints recorded without market cap data."""
+    print("=== process_pending_mints() starting ===", flush=True)
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+    except Exception as e:
+        print(f"DATABASE CONNECTION FAILED: {e}", flush=True)
+        return
+
+    c.execute("""
+        SELECT id, mint FROM tracked_buys
+        WHERE market_cap_at_buy IS NULL AND wallet = %s
+    """, (TARGET_WALLET,))
+    pending = c.fetchall()
+    print(f"{len(pending)} pending mints to process", flush=True)
+
+    if not pending:
+        c.close()
+        conn.close()
+        return
+
+    mints = [row[1] for row in pending]
+    market_caps = get_market_caps_batch(mints)
+    print(f"Resolved market caps for {len(market_caps)} of {len(mints)} pending mints", flush=True)
+
+    kept = 0
+    dropped = 0
+    for row_id, mint in pending:
+        mc = market_caps.get(mint)
+        if mc is None:
+            print(f"  {mint}: no market cap data, dropping", flush=True)
+            c.execute("DELETE FROM tracked_buys WHERE id = %s", (row_id,))
+            dropped += 1
+        elif mc >= 20000:
+            print(f"  {mint}: market cap ${mc:,.0f} too high, dropping", flush=True)
+            c.execute("DELETE FROM tracked_buys WHERE id = %s", (row_id,))
+            dropped += 1
+        else:
+            c.execute(
+                "UPDATE tracked_buys SET market_cap_at_buy = %s WHERE id = %s",
+                (mc, row_id)
+            )
+            kept += 1
+            print(f"  RESOLVED: {mint} at ${mc:,.0f}", flush=True)
+
+    conn.commit()
+    c.close()
+    conn.close()
+    print(f"=== process_pending_mints() finished — {kept} kept, {dropped} dropped ===", flush=True)
+
+
 def record_new_buys():
     print("=== record_new_buys() starting ===", flush=True)
 
@@ -208,9 +267,6 @@ def record_new_buys():
     mints = extract_bought_mints(txs, TARGET_WALLET)
     print(f"Found {len(mints)} unique mints bought", flush=True)
 
-    market_caps = get_market_caps_batch(mints)
-    print(f"Got market cap data for {len(market_caps)} of {len(mints)} mints", flush=True)
-
     recorded_count = 0
     for mint in mints:
         try:
@@ -218,20 +274,12 @@ def record_new_buys():
             if c.fetchone():
                 continue
 
-            market_cap = market_caps.get(mint)
-            if market_cap is None:
-                print(f"  {mint}: no market cap data, skipping", flush=True)
-                continue
-            if market_cap >= 20000:
-                print(f"  {mint}: market cap ${market_cap:,.0f} too high, skipping", flush=True)
-                continue
-
             c.execute(
-                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
-                (mint, TARGET_WALLET, market_cap)
+                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, NULL)",
+                (mint, TARGET_WALLET)
             )
             recorded_count += 1
-            print(f"  RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
+            print(f"  RECORDED (pending): {mint}", flush=True)
 
         except Exception as e:
             print(f"  Error processing {mint}: {e}", flush=True)
@@ -241,11 +289,15 @@ def record_new_buys():
     conn.commit()
     c.close()
     conn.close()
-    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded ===", flush=True)
+    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded (pending) ===", flush=True)
 
 
 def record_buys_batch(mints):
+    """Webhook handler: insert mints immediately, resolve market caps later."""
     unique_mints = list(set(mints))
+    if not unique_mints:
+        return
+
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -258,19 +310,15 @@ def record_buys_batch(mints):
 
         if not new_mints:
             c.close()
+            conn.close()
             return
 
-        market_caps = get_market_caps_batch(new_mints)
-
         for mint in new_mints:
-            market_cap = market_caps.get(mint)
-            if market_cap is None or market_cap >= 20000:
-                continue
             c.execute(
-                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
-                (mint, TARGET_WALLET, market_cap)
+                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, NULL)",
+                (mint, TARGET_WALLET)
             )
-            print(f"WEBHOOK RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
+            print(f"WEBHOOK RECORDED (pending): {mint}", flush=True)
 
         conn.commit()
         c.close()
@@ -297,6 +345,7 @@ def check_outcomes():
         SELECT id, mint FROM tracked_buys
         WHERE checked_final = FALSE
         AND buy_time <= NOW() - INTERVAL '3 days'
+        AND market_cap_at_buy IS NOT NULL
     """)
     ready = c.fetchall()
     print(f"{len(ready)} buys ready for outcome check", flush=True)
@@ -318,6 +367,7 @@ def check_outcomes():
 @app.route("/run-check", methods=["GET", "POST"])
 def run_check():
     print(">>> /run-check endpoint HIT <<<", flush=True)
+    process_pending_mints()
     record_new_buys()
     check_outcomes()
     return jsonify({"status": "done"})
