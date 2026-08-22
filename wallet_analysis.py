@@ -197,29 +197,38 @@ def record_new_buys():
     print(f"=== record_new_buys() finished — {recorded_count} new buys recorded ===", flush=True)
 
 
-def record_single_buy(mint):
+def record_buys_batch(mints):
+    unique_mints = list(set(mints))
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
-        if c.fetchone():
+
+        new_mints = []
+        for mint in unique_mints:
+            c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
+            if not c.fetchone():
+                new_mints.append(mint)
+
+        if not new_mints:
             c.close()
             return
 
-        market_cap = get_current_market_cap(mint)
-        if market_cap is None or market_cap >= 20000:
-            c.close()
-            return
+        market_caps = get_market_caps_batch(new_mints)
 
-        c.execute(
-            "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
-            (mint, TARGET_WALLET, market_cap)
-        )
+        for mint in new_mints:
+            market_cap = market_caps.get(mint)
+            if market_cap is None or market_cap >= 20000:
+                continue
+            c.execute(
+                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, %s)",
+                (mint, TARGET_WALLET, market_cap)
+            )
+            print(f"WEBHOOK RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
+
         conn.commit()
         c.close()
-        print(f"WEBHOOK RECORDED: {mint} at ${market_cap:,.0f}", flush=True)
     except Exception as e:
-        print(f"record_single_buy error for {mint}: {e}", flush=True)
+        print(f"record_buys_batch error: {e}", flush=True)
         try:
             conn.rollback()
         except Exception:
@@ -276,12 +285,15 @@ def webhook():
     transactions = data if isinstance(data, list) else [data]
     print(f"Webhook received {len(transactions)} transaction(s)", flush=True)
 
+    all_mints = []
     for tx in transactions:
         if not isinstance(tx, dict):
             continue
         mints = extract_bought_mints([tx], TARGET_WALLET)
-        for mint in mints:
-            record_single_buy(mint)
+        all_mints.extend(mints)
+
+    if all_mints:
+        record_buys_batch(all_mints)
 
     return "ok", 200
 
