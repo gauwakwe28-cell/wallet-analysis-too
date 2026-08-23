@@ -16,19 +16,16 @@ TARGET_WALLET = os.environ.get("TARGET_WALLET")
 
 print(f"Config loaded — DATABASE_URL set: {bool(DATABASE_URL)}, HELIUS_API_KEY set: {bool(HELIUS_API_KEY)}, TARGET_WALLET: {TARGET_WALLET}", flush=True)
 
-# --- Blocked system / stablecoin mints ---
 BLOCKED_MINTS = {
-    "So11111111111111111111111111111111111111112",   # Wrapped SOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 }
 
-# --- Global rate limiter ---
 _dex_lock = threading.Lock()
 _next_allowed_request_time = 0
 _market_cap_cache = {}
 
-# --- Background job lock ---
 _job_lock = threading.Lock()
 _job_running = False
 
@@ -235,7 +232,6 @@ def mark_signature_processed(signature):
 
 
 def process_pending_mints():
-    """Resolve market caps for pending mints. Keep only 5000 < mc <= 20000."""
     print("=== process_pending_mints() starting ===", flush=True)
     try:
         conn = get_conn()
@@ -363,7 +359,6 @@ def record_new_buys():
 
 
 def record_buys_batch(mints):
-    """Webhook: insert mints immediately, resolve later."""
     unique_mints = list(set(mints))
     if not unique_mints:
         return
@@ -524,6 +519,139 @@ def results():
             "checked_final": checked
         })
     return jsonify(output)
+
+
+@app.route("/live-pending")
+def live_pending():
+    """Fetch live market caps for all pending tokens right now."""
+    if not TARGET_WALLET:
+        return jsonify({"error": "TARGET_WALLET not set"}), 500
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, mint, market_cap_at_buy, buy_time
+        FROM tracked_buys
+        WHERE checked_final = FALSE
+        AND market_cap_at_buy IS NOT NULL
+        AND wallet = %s
+        ORDER BY buy_time DESC
+    """, (TARGET_WALLET,))
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+
+    if not rows:
+        return jsonify({"pending": [], "count": 0})
+
+    mints = [row[1] for row in rows]
+    current_caps = get_market_caps_batch(mints)
+
+    results = []
+    for row_id, mint, entry_mc, buy_time in rows:
+        current_mc = current_caps.get(mint)
+        mult = None
+        if current_mc and entry_mc:
+            mult = round(float(current_mc) / float(entry_mc), 2)
+
+        results.append({
+            "mint": mint,
+            "entry_market_cap": float(entry_mc) if entry_mc else None,
+            "current_market_cap": float(current_mc) if current_mc else None,
+            "multiplier": mult,
+            "status": "up" if mult and mult > 1 else ("down" if mult and mult < 1 else "flat"),
+            "buy_time": str(buy_time)
+        })
+
+    return jsonify({"pending": results, "count": len(results)})
+
+
+@app.route("/summary")
+def summary():
+    """Compact summary of pending positions. Easy to copy-paste."""
+    if not TARGET_WALLET:
+        return jsonify({"error": "TARGET_WALLET not set"}), 500
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT mint, market_cap_at_buy
+        FROM tracked_buys
+        WHERE checked_final = FALSE
+        AND market_cap_at_buy IS NOT NULL
+        AND wallet = %s
+    """, (TARGET_WALLET,))
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+
+    if not rows:
+        return jsonify({
+            "total_pending": 0,
+            "up": 0,
+            "down": 0,
+            "flat": 0,
+            "dead_or_no_data": 0,
+            "avg_multiplier": None,
+            "best": None,
+            "worst": None
+        })
+
+    mints = [row[0] for row in rows]
+    entry_map = {row[0]: float(row[1]) for row in rows}
+    current_caps = get_market_caps_batch(mints)
+
+    up = down = flat = dead = 0
+    multipliers = []
+    best_mint = worst_mint = None
+    best_mult = -999999
+    worst_mult = 999999
+
+    for mint, entry_mc in entry_map.items():
+        current_mc = current_caps.get(mint)
+        if current_mc is None:
+            dead += 1
+            continue
+
+        mult = current_mc / entry_mc
+        multipliers.append(mult)
+
+        if mult > 1:
+            up += 1
+        elif mult < 1:
+            down += 1
+        else:
+            flat += 1
+
+        if mult > best_mult:
+            best_mult = mult
+            best_mint = mint
+        if mult < worst_mult:
+            worst_mult = mult
+            worst_mint = mint
+
+    avg_mult = round(sum(multipliers) / len(multipliers), 2) if multipliers else None
+
+    return jsonify({
+        "total_pending": len(rows),
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "dead_or_no_data": dead,
+        "avg_multiplier": avg_mult,
+        "best": {
+            "mint": best_mint,
+            "entry": entry_map.get(best_mint),
+            "current": current_caps.get(best_mint),
+            "multiplier": round(best_mult, 2)
+        } if best_mint else None,
+        "worst": {
+            "mint": worst_mint,
+            "entry": entry_map.get(worst_mint),
+            "current": current_caps.get(worst_mint),
+            "multiplier": round(worst_mult, 2)
+        } if worst_mint else None
+    })
 
 
 @app.route("/")
