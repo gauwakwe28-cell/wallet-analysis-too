@@ -16,12 +16,19 @@ TARGET_WALLET = os.environ.get("TARGET_WALLET")
 
 print(f"Config loaded — DATABASE_URL set: {bool(DATABASE_URL)}, HELIUS_API_KEY set: {bool(HELIUS_API_KEY)}, TARGET_WALLET: {TARGET_WALLET}", flush=True)
 
-# --- Global rate limiter: one shared clock + 429 ban timer ---
+# --- Blocked system / stablecoin mints ---
+BLOCKED_MINTS = {
+    "So11111111111111111111111111111111111111112",   # Wrapped SOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+}
+
+# --- Global rate limiter ---
 _dex_lock = threading.Lock()
 _next_allowed_request_time = 0
-_market_cap_cache = {}  # mint -> (timestamp, value_or_False)
+_market_cap_cache = {}
 
-# --- Background job lock so cron jobs don't pile up ---
+# --- Background job lock ---
 _job_lock = threading.Lock()
 _job_running = False
 
@@ -62,6 +69,12 @@ def init_db():
             outcome_checked_at TIMESTAMP
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS processed_signatures (
+            signature TEXT PRIMARY KEY,
+            processed_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
     conn.commit()
     c.close()
     conn.close()
@@ -72,7 +85,7 @@ def get_current_market_cap(mint, retries=3):
     now = time.time()
     if mint in _market_cap_cache:
         cached_at, value = _market_cap_cache[mint]
-        if now - cached_at < 90:  # 90 seconds for hits AND misses
+        if now - cached_at < 90:
             return value if value is not False else None
 
     try:
@@ -99,7 +112,6 @@ def get_current_market_cap(mint, retries=3):
             _market_cap_cache[mint] = (now, False)
             return None
 
-        # FIX: scan ALL pairs for the first one with a valid fdv
         for pair in pairs:
             fdv = pair.get("fdv")
             if fdv is not None and fdv != "":
@@ -145,7 +157,6 @@ def get_market_caps_batch(mints):
                     if fdv is None or fdv == "":
                         continue
 
-                    # FIX: check BOTH baseToken and quoteToken addresses
                     base_mint = pair.get("baseToken", {}).get("address")
                     quote_mint = pair.get("quoteToken", {}).get("address")
 
@@ -196,13 +207,35 @@ def extract_bought_mints(transactions, wallet):
         for transfer in tx.get("tokenTransfers", []) or []:
             if transfer.get("toUserAccount") == wallet:
                 mint = transfer.get("mint")
-                if mint:
+                if mint and mint not in BLOCKED_MINTS:
                     mints.add(mint)
     return list(mints)
 
 
+def is_signature_processed(signature):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM processed_signatures WHERE signature = %s", (signature,))
+    exists = c.fetchone() is not None
+    c.close()
+    conn.close()
+    return exists
+
+
+def mark_signature_processed(signature):
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO processed_signatures (signature) VALUES (%s) ON CONFLICT DO NOTHING", (signature,))
+        conn.commit()
+    except Exception:
+        pass
+    c.close()
+    conn.close()
+
+
 def process_pending_mints():
-    """Fetch market caps for mints recorded without market cap data."""
+    """Resolve market caps for pending mints. Keep only 5000 < mc <= 20000."""
     print("=== process_pending_mints() starting ===", flush=True)
     try:
         conn = get_conn()
@@ -231,12 +264,13 @@ def process_pending_mints():
     dropped = 0
     for row_id, mint in pending:
         mc = market_caps.get(mint)
+
         if mc is None:
             print(f"  {mint}: no market cap data, dropping", flush=True)
             c.execute("DELETE FROM tracked_buys WHERE id = %s", (row_id,))
             dropped += 1
-        elif mc >= 20000:
-            print(f"  {mint}: market cap ${mc:,.0f} too high, dropping", flush=True)
+        elif mc <= 5000 or mc > 20000:
+            print(f"  {mint}: market cap ${mc:,.0f} outside range (5000-20000), dropping", flush=True)
             c.execute("DELETE FROM tracked_buys WHERE id = %s", (row_id,))
             dropped += 1
         else:
@@ -285,36 +319,51 @@ def record_new_buys():
         conn.close()
         return
 
-    mints = extract_bought_mints(txs, TARGET_WALLET)
-    print(f"Found {len(mints)} unique mints bought", flush=True)
-
     recorded_count = 0
-    for mint in mints:
-        try:
-            c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
-            if c.fetchone():
+    skipped_count = 0
+
+    for tx in txs:
+        signature = tx.get("signature")
+        if not signature:
+            continue
+
+        if is_signature_processed(signature):
+            skipped_count += 1
+            continue
+
+        mints = extract_bought_mints([tx], TARGET_WALLET)
+        if not mints:
+            mark_signature_processed(signature)
+            continue
+
+        for mint in mints:
+            try:
+                c.execute("SELECT 1 FROM tracked_buys WHERE mint = %s AND wallet = %s", (mint, TARGET_WALLET))
+                if c.fetchone():
+                    continue
+
+                c.execute(
+                    "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, NULL)",
+                    (mint, TARGET_WALLET)
+                )
+                recorded_count += 1
+                print(f"  RECORDED (pending): {mint}", flush=True)
+
+            except Exception as e:
+                print(f"  Error processing {mint}: {e}", flush=True)
+                conn.rollback()
                 continue
 
-            c.execute(
-                "INSERT INTO tracked_buys (mint, wallet, market_cap_at_buy) VALUES (%s, %s, NULL)",
-                (mint, TARGET_WALLET)
-            )
-            recorded_count += 1
-            print(f"  RECORDED (pending): {mint}", flush=True)
-
-        except Exception as e:
-            print(f"  Error processing {mint}: {e}", flush=True)
-            conn.rollback()
-            continue
+        mark_signature_processed(signature)
 
     conn.commit()
     c.close()
     conn.close()
-    print(f"=== record_new_buys() finished — {recorded_count} new buys recorded (pending) ===", flush=True)
+    print(f"=== record_new_buys() finished — {recorded_count} new, {skipped_count} sigs skipped ===", flush=True)
 
 
 def record_buys_batch(mints):
-    """Webhook handler: insert mints immediately, resolve market caps later."""
+    """Webhook: insert mints immediately, resolve later."""
     unique_mints = list(set(mints))
     if not unique_mints:
         return
@@ -397,7 +446,6 @@ def check_outcomes():
 
 
 def run_all_checks():
-    """Runs the full check cycle in a background thread."""
     global _job_running
     try:
         process_pending_mints()
@@ -476,18 +524,6 @@ def results():
             "checked_final": checked
         })
     return jsonify(output)
-
-
-@app.route("/cleanup-null-entries", methods=["GET", "POST"])
-def cleanup_null_entries():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM tracked_buys WHERE market_cap_at_buy IS NULL")
-    deleted = c.rowcount
-    conn.commit()
-    c.close()
-    conn.close()
-    return jsonify({"deleted": deleted})
 
 
 @app.route("/")
